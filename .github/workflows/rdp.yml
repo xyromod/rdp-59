@@ -1,0 +1,151 @@
+name: Voryken Windows Test RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-rdp-test:
+    runs-on: windows-2025
+    timeout-minutes: 355
+    env:
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+    steps:
+      - name: Validate Tailscale secret
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) { throw 'Missing TAILSCALE_AUTHKEY secret' }
+
+      - name: Create RDP user with administrator rights for installation tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $username = 'VorykenRDP'
+          $fixedPassword = '12345'
+          # WARNING: 12345 is a deliberately weak shared password. All public
+          # repositories using this template disclose it. Restrict RDP to the tailnet.
+          # Windows Server normally refuses a five-digit password. Temporarily
+          # relax local password policy solely to create this temporary test user,
+          # then restore the original policy.
+          $export = Join-Path $env:RUNNER_TEMP 'voryken-policy-original.inf'
+          $relaxed = Join-Path $env:RUNNER_TEMP 'voryken-policy-relaxed.inf'
+          $restore = Join-Path $env:RUNNER_TEMP 'voryken-policy-restore.inf'
+          $db = Join-Path $env:RUNNER_TEMP 'voryken-password.sdb'
+          secedit /export /cfg $export /areas SECURITYPOLICY /quiet | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not export local password policy' }
+          $existing = Get-Content $export -Raw
+          $complexity = [regex]::Match($existing, '(?m)^PasswordComplexity\s*=\s*(\d+)\s*$')
+          $minLength = [regex]::Match($existing, '(?m)^MinimumPasswordLength\s*=\s*(\d+)\s*$')
+          if (-not $complexity.Success -or -not $minLength.Success) {
+            throw 'Could not determine original password policy; refusing to change security settings'
+          }
+          $header = "[Unicode]`r`nUnicode=yes`r`n[System Access]`r`n"
+          $footer = "[Version]`r`nsignature=`"`$CHICAGO`$`"`r`nRevision=1`r`n"
+          $utf16 = New-Object System.Text.UnicodeEncoding($false, $true)
+          [System.IO.File]::WriteAllText($relaxed, $header + "MinimumPasswordLength = 0`r`nPasswordComplexity = 0`r`n" + $footer, $utf16)
+          [System.IO.File]::WriteAllText($restore, $header + "MinimumPasswordLength = $($minLength.Groups[1].Value)`r`nPasswordComplexity = $($complexity.Groups[1].Value)`r`n" + $footer, $utf16)
+          secedit /configure /db $db /cfg $relaxed /areas SECURITYPOLICY /quiet | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not temporarily configure password policy' }
+          try {
+            $secure = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
+            if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $secure -AccountNeverExpires -Description 'Temporary isolated CI RDP user' | Out-Null
+            } else {
+              Set-LocalUser -Name $username -Password $secure
+            }
+          } finally {
+            secedit /configure /db $db /cfg $restore /areas SECURITYPOLICY /quiet | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Warning 'Could not restore previous password policy' }
+          }
+          # Este usuario RDP puede instalar y abrir aplicaciones que requieren
+          # administrador. UAC sigue ACTIVO: en una sesión interactiva Windows
+          # pedirá consentimiento, pero no la contraseña de runneradmin.
+          $adminSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+          $adminMembers = Get-LocalGroupMember -SID $adminSid -ErrorAction Stop
+          if (-not ($adminMembers | Where-Object { $_.Name -eq ($env:COMPUTERNAME + '\' + $username) })) {
+            Add-LocalGroupMember -SID $adminSid -Member ($env:COMPUTERNAME + '\' + $username) -ErrorAction Stop
+          }
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username -ErrorAction SilentlyContinue
+          Write-Host 'VorykenRDP tiene permisos de Administrador; UAC sigue habilitado.'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+          Get-NetFirewallRule -DisplayName 'Voryken RDP Tailnet' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'Voryken RDP Tailnet' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          Write-Host 'Temporary RDP account ready: VorykenRDP; NLA enabled; inbound RDP limited to Tailscale addresses.'
+
+      - name: Install current stable Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://pkgs.tailscale.com/stable/'
+          $page = (Invoke-WebRequest -Uri $base -UseBasicParsing).Content
+          $all = [regex]::Matches($page, 'tailscale-setup-(\d+\.\d+\.\d+)-amd64\.msi') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+          $version = $all | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+          if (-not $version) { throw 'Tailscale installer could not be located' }
+          $name = "tailscale-setup-$version-amd64.msi"
+          $url = $base + $name
+          $path = Join-Path $env:TEMP 'voryken-tailscale.msi'
+          Invoke-WebRequest -Uri $url -OutFile $path -UseBasicParsing
+          $expected = (Invoke-WebRequest -Uri ($url + '.sha256') -UseBasicParsing).Content
+          $expectedHash = ([regex]::Match($expected, '[a-fA-F0-9]{64}')).Value
+          if (-not $expectedHash) { throw 'Tailscale checksum missing' }
+          $actual = (Get-FileHash $path -Algorithm SHA256).Hash
+          if ($actual -ne $expectedHash) { throw 'Tailscale checksum mismatch' }
+          $installer = Start-Process msiexec.exe -ArgumentList @('/i', "`"$path`"", '/qn', '/norestart') -Wait -PassThru
+          if ($installer.ExitCode -notin @(0, 3010)) { throw "msiexec exit code $($installer.ExitCode)" }
+
+      - name: Connect ephemeral Tailscale node
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) { throw 'Tailscale executable not found' }
+          $hostname = 'vk-rdp-' + $env:GITHUB_RUN_ID
+          & $exe up --auth-key=$env:TS_AUTHKEY --hostname=$hostname --accept-dns=false
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale could not connect' }
+          $ip = (& $exe ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw 'No Tailscale IPv4 address assigned' }
+          Write-Host "VORYKEN_TAILSCALE_HOST=$hostname"
+          Write-Host "VORYKEN_TAILSCALE_IP=$ip"
+          Write-Host 'RDP user: VorykenRDP; temporary environment prepared.'
+
+      - name: Checkout encrypted project and worker
+        uses: actions/checkout@v4
+
+      - name: Configure Python for worker
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restrict control API to tailnet
+        shell: pwsh
+        run: |
+          Get-NetFirewallRule -DisplayName 'Voryken Agent Tailnet' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'Voryken Agent Tailnet' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 18765 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+
+      - name: Prepare project and run standby worker
+        shell: pwsh
+        env:
+          VORYKEN_PROJECT_KEY: ${{ secrets.VORYKEN_PROJECT_KEY }}
+          VORYKEN_AGENT_TOKEN: ${{ secrets.VORYKEN_AGENT_TOKEN }}
+          VORYKEN_RELAY_PORTS: ${{ secrets.VORYKEN_RELAY_PORTS }}
+          VORYKEN_SHARE_CONFIG: ${{ secrets.VORYKEN_SHARE_CONFIG }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --quiet cryptography
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install project decryptor' }
+          python .voryken/worker_agent.py
+          if ($LASTEXITCODE -ne 0) { throw 'Worker agent exited unexpectedly' }
+
+      - name: Temporary interactive test window
+        shell: pwsh
+        run: |
+          Write-Host 'Time-limited manual test environment is running.'
+          $until = (Get-Date).AddMinutes(340)
+          while ((Get-Date) -lt $until) { Start-Sleep -Seconds 60 }
